@@ -180,6 +180,8 @@ button, input { font: inherit; }
 .source-viewer { max-height: 340px; overflow: auto; margin: 0; border: 1px solid rgba(143, 163, 191, .13); border-radius: 6px; background: rgba(3, 8, 14, .62); padding: 12px; color: #bfccda; font-family: var(--font-geist-mono), monospace; font-size: 9px; line-height: 1.65; tab-size: 2; white-space: pre; }
 .question-form { margin-top: 14px; }
 .question-form .input-label { margin: 0 0 7px; }
+.related-files-toggle { display: flex; align-items: center; gap: 7px; margin: 0 0 8px; color: #95a4b8; font-size: 9px; }
+.related-files-toggle input { accent-color: #78d6b8; }
 .question-form textarea { display: block; width: 100%; resize: vertical; border: 1px solid rgba(143, 163, 191, .19); border-radius: 6px; background: rgba(6, 12, 20, .65); padding: 10px; color: #dce5f1; font: inherit; font-size: 10px; line-height: 1.55; }
 .question-form textarea::placeholder { color: #64738a; }
 .question-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; }
@@ -189,6 +191,11 @@ button, input { font: inherit; }
 .answer-card { margin-top: 13px; border: 1px solid rgba(114, 224, 189, .17); border-radius: 6px; background: rgba(56, 119, 100, .08); padding: 11px; }
 .answer-card .section-eyebrow { display: block; margin-bottom: 4px; color: #82cbb2; font-size: 7px; }
 .answer-source { overflow-wrap: anywhere; margin: 0 0 9px; color: #8fa99e; font-family: var(--font-geist-mono), monospace; font-size: 8px; }
+.answer-source-list { display: grid; gap: 4px; margin: 0 0 9px; padding: 0; color: #aab9cb; font-family: var(--font-geist-mono), monospace; font-size: 8px; list-style: none; }
+.answer-source-list li { overflow-wrap: anywhere; }
+.context-coverage, .context-limited { margin: 0 0 9px; color: #83cbb2; font-size: 8px; line-height: 1.5; }
+.context-limited { color: #e8bd74; }
+.citation-validation-note { margin: 0 0 9px; color: #8392a6; font-size: 8px; line-height: 1.5; }
 .answer-text { color: #d2ded9; font-size: 10px; line-height: 1.7; overflow-wrap: anywhere; }
 .answer-text > :first-child { margin-top: 0; }
 .answer-text > :last-child { margin-bottom: 0; }

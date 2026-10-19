@@ -54,3 +54,15 @@ class RepositoryQuestionResponse(BaseModel):
     repository: str
     path: str
     answer: str
+
+
+class RelatedSource(BaseModel):
+    source_id: str
+    path: str
+    size_bytes: int
+
+
+class RelatedRepositoryQuestionResponse(RepositoryQuestionResponse):
+    sources: list[RelatedSource]
+    context_complete: bool
+    context_message: str | None = None

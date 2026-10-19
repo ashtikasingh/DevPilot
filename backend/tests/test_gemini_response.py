@@ -10,6 +10,7 @@ from app.services import gemini
 class FakeAsyncClient:
     def __init__(self, response):
         self.response = response
+        self.request_bodies = []
 
     async def __aenter__(self):
         return self
@@ -18,6 +19,7 @@ class FakeAsyncClient:
         return False
 
     async def post(self, *args, **kwargs):
+        self.request_bodies.append(kwargs.get("json"))
         return self.response
 
 
@@ -86,6 +88,18 @@ class GeminiResponseTests(unittest.IsolatedAsyncioTestCase):
     async def test_normal_completion_returns_answer(self):
         answer = await self.ask_with_response(candidate_response("Complete answer."))
         self.assertEqual(answer, "Complete answer.")
+
+    async def test_single_file_mode_keeps_1024_output_token_limit(self):
+        client = FakeAsyncClient(provider_response(candidate_response("Complete answer.")))
+        with (
+            patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+            patch.object(gemini.httpx, "AsyncClient", return_value=client),
+        ):
+            await gemini.answer_about_source(
+                "owner/repo", "file.tsx", "const answer = 42;", "Explain this file"
+            )
+
+        self.assertEqual(client.request_bodies[0]["generationConfig"]["maxOutputTokens"], 1024)
 
     async def test_max_tokens_is_reported_as_safe_incomplete_response(self):
         with self.assertRaises(gemini.GeminiAPIError) as raised:

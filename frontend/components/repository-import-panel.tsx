@@ -1,7 +1,16 @@
 "use client";
 
-import { useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
+import { useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 import { parseMarkdown, type MarkdownBlock, type MarkdownInline } from "@/lib/markdown";
+import {
+  beginRequest,
+  getContextCoverageMessage,
+  getQuestionEndpoint,
+  getSourceLabel,
+  invalidateRequest,
+  isCurrentRequest,
+  type RelatedSourceMetadata,
+} from "@/lib/repository-question";
 
 type RepositoryMetadata = {
   name: string;
@@ -46,6 +55,9 @@ type RepositoryAnswer = {
   repository: string;
   path: string;
   answer: string;
+  sources?: RelatedSourceMetadata[];
+  context_complete?: boolean;
+  context_message?: string | null;
 };
 
 const API_BASE_URL = (
@@ -180,12 +192,17 @@ export default function RepositoryImportPanel() {
   const [sourceError, setSourceError] = useState<string | null>(null);
   const [isLoadingSource, setIsLoadingSource] = useState(false);
   const [question, setQuestion] = useState("");
+  const [relatedFilesEnabled, setRelatedFilesEnabled] = useState(false);
   const [answer, setAnswer] = useState<RepositoryAnswer | null>(null);
   const [questionError, setQuestionError] = useState<string | null>(null);
   const [isAsking, setIsAsking] = useState(false);
+  const sourceRequestIdentity = useRef({ current: 0 });
+  const questionRequestIdentity = useRef({ current: 0 });
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    invalidateRequest(sourceRequestIdentity.current);
+    invalidateRequest(questionRequestIdentity.current);
     setIsLoading(true);
     setInspection(null);
     setErrorMessage(null);
@@ -195,6 +212,9 @@ export default function RepositoryImportPanel() {
     setAnswer(null);
     setQuestionError(null);
     setQuestion("");
+    setRelatedFilesEnabled(false);
+    setIsLoadingSource(false);
+    setIsAsking(false);
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/repositories/inspect`, {
@@ -225,13 +245,17 @@ export default function RepositoryImportPanel() {
 
   async function handleSelectFile(entry: RepositoryTreeEntry) {
     if (!inspection || entry.type !== "blob") return;
+    invalidateRequest(questionRequestIdentity.current);
     const [owner, repository] = inspection.repository.full_name.split("/", 2);
     setSelectedPath(entry.path);
     setSourceFile(null);
     setAnswer(null);
     setQuestionError(null);
+    setRelatedFilesEnabled(false);
     setSourceError(null);
     setIsLoadingSource(true);
+    setIsAsking(false);
+    const requestId = beginRequest(sourceRequestIdentity.current);
 
     try {
       const response = await fetch(`${API_BASE_URL}/api/repositories/file`, {
@@ -247,15 +271,32 @@ export default function RepositoryImportPanel() {
       });
       if (!response.ok) {
         const body = (await response.json().catch(() => null)) as ErrorResponse | null;
-        setSourceError(body?.error?.message ?? "Could not retrieve this source file.");
+        if (isCurrentRequest(sourceRequestIdentity.current, requestId)) {
+          setSourceError(body?.error?.message ?? "Could not retrieve this source file.");
+        }
         return;
       }
-      setSourceFile((await response.json()) as RepositoryFile);
+      const result = (await response.json()) as RepositoryFile;
+      if (isCurrentRequest(sourceRequestIdentity.current, requestId)) {
+        setSourceFile(result);
+      }
     } catch {
-      setSourceError("Could not reach DevPilot’s API. Check that the backend is running.");
+      if (isCurrentRequest(sourceRequestIdentity.current, requestId)) {
+        setSourceError("Could not reach DevPilot’s API. Check that the backend is running.");
+      }
     } finally {
-      setIsLoadingSource(false);
+      if (isCurrentRequest(sourceRequestIdentity.current, requestId)) {
+        setIsLoadingSource(false);
+      }
     }
+  }
+
+  function handleRelatedFilesToggle(enabled: boolean) {
+    invalidateRequest(questionRequestIdentity.current);
+    setRelatedFilesEnabled(enabled);
+    setAnswer(null);
+    setQuestionError(null);
+    setIsAsking(false);
   }
 
   async function handleAskQuestion(event: FormEvent<HTMLFormElement>) {
@@ -265,9 +306,12 @@ export default function RepositoryImportPanel() {
     setIsAsking(true);
     setQuestionError(null);
     setAnswer(null);
+    const requestId = beginRequest(questionRequestIdentity.current);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/repositories/ask`, {
+      const response = await fetch(`${API_BASE_URL}${getQuestionEndpoint(
+        relatedFilesEnabled ? "related-files" : "single-file",
+      )}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -281,14 +325,23 @@ export default function RepositoryImportPanel() {
       });
       if (!response.ok) {
         const body = (await response.json().catch(() => null)) as ErrorResponse | null;
-        setQuestionError(body?.error?.message ?? "DevPilot could not answer this question.");
+        if (isCurrentRequest(questionRequestIdentity.current, requestId)) {
+          setQuestionError(body?.error?.message ?? "DevPilot could not answer this question.");
+        }
         return;
       }
-      setAnswer((await response.json()) as RepositoryAnswer);
+      const result = (await response.json()) as RepositoryAnswer;
+      if (isCurrentRequest(questionRequestIdentity.current, requestId)) {
+        setAnswer(result);
+      }
     } catch {
-      setQuestionError("Could not reach DevPilot’s API. Check that the backend is running.");
+      if (isCurrentRequest(questionRequestIdentity.current, requestId)) {
+        setQuestionError("Could not reach DevPilot’s API. Check that the backend is running.");
+      }
     } finally {
-      setIsAsking(false);
+      if (isCurrentRequest(questionRequestIdentity.current, requestId)) {
+        setIsAsking(false);
+      }
     }
   }
 
@@ -383,11 +436,27 @@ export default function RepositoryImportPanel() {
                 <p className="source-path"><span>FILE</span>{sourceFile.repository}/{sourceFile.path}</p>
                 <pre className="source-viewer" aria-label={`Source code for ${sourceFile.path}`}><code>{sourceFile.content}</code></pre>
                 <form className="question-form" onSubmit={handleAskQuestion}>
-                  <label className="input-label" htmlFor="file-question">ASK ABOUT THIS FILE</label>
+                  <label className="input-label" htmlFor="file-question">
+                    {relatedFilesEnabled ? "ASK ACROSS RELATED FILES" : "ASK ABOUT THIS FILE"}
+                  </label>
+                  <label className="related-files-toggle">
+                    <input
+                      type="checkbox"
+                      checked={relatedFilesEnabled}
+                      onChange={(event) => handleRelatedFilesToggle(event.target.checked)}
+                    />
+                    Include up to 3 direct relative imports
+                  </label>
                   <textarea
                     id="file-question"
                     value={question}
-                    onChange={(event) => setQuestion(event.target.value)}
+                    onChange={(event) => {
+                      setQuestion(event.target.value);
+                      invalidateRequest(questionRequestIdentity.current);
+                      setAnswer(null);
+                      setQuestionError(null);
+                      setIsAsking(false);
+                    }}
                     placeholder="What does this function do?"
                     maxLength={2000}
                     rows={3}
@@ -395,18 +464,50 @@ export default function RepositoryImportPanel() {
                     aria-describedby="question-limit"
                   />
                   <div className="question-actions">
-                    <span id="question-limit">Up to 2,000 characters · Answers use this file only</span>
+                    <span id="question-limit">
+                      Up to 2,000 characters · {relatedFilesEnabled
+                        ? "Selected file and bounded direct imports"
+                        : "Selected file only"}
+                    </span>
                     <button type="submit" disabled={isAsking || !question.trim()}>
                       {isAsking ? <><span className="button-spinner" />Asking</> : <>Ask Gemini <span aria-hidden="true">→</span></>}
                     </button>
                   </div>
                 </form>
                 {questionError && <p className="import-error" role="alert">{questionError}</p>}
-                {isAsking && <p className="import-loading" role="status">Gemini is reviewing the selected file…</p>}
+                {isAsking && <p className="import-loading" role="status">
+                  {relatedFilesEnabled
+                    ? "Gemini is reviewing the selected file and related imports…"
+                    : "Gemini is reviewing the selected file…"}
+                </p>}
                 {answer && (
                   <div className="answer-card" aria-live="polite">
-                    <span className="section-eyebrow">ANSWER BASED ON</span>
+                    <span className="section-eyebrow">
+                      {answer.sources ? "SOURCES INCLUDED" : "ANSWER BASED ON"}
+                    </span>
                     <p className="answer-source">{answer.repository}/{answer.path}</p>
+                    {answer.sources && (
+                      <>
+                        <ul className="answer-source-list">
+                          {answer.sources.map((source) => (
+                            <li key={source.source_id}>{getSourceLabel(source)}</li>
+                          ))}
+                        </ul>
+                        {answer.context_complete ? (
+                          <p className="context-coverage">Context includes the selected file and resolved direct imports only.</p>
+                        ) : (
+                          <p className="context-limited" role="status">
+                            Limited context: {getContextCoverageMessage(
+                              false,
+                              answer.context_message,
+                            )}
+                          </p>
+                        )}
+                        <p className="citation-validation-note">
+                          Citation ranges are checked against supplied source lines; this does not verify that a citation semantically supports its claim.
+                        </p>
+                      </>
+                    )}
                     <MarkdownAnswer content={answer.answer} />
                   </div>
                 )}

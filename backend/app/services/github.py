@@ -212,6 +212,65 @@ async def inspect_public_repository(repository_url: str) -> InspectRepositoryRes
         ) from error
 
 
+async def fetch_public_repository_tree(
+    owner: str,
+    repository: str,
+    ref: str,
+) -> tuple[list[RepositoryTreeEntry], bool]:
+    _validate_file_reference(owner, repository, "tree")
+    if not isinstance(ref, str) or not ref or len(ref) > 255:
+        raise GitHubAPIError(
+            "invalid_file_reference",
+            "The repository branch could not be resolved. Inspect the repository again.",
+            422,
+        )
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        "User-Agent": "DevPilot-Repository-Inspector",
+    }
+    try:
+        async with httpx.AsyncClient(
+            base_url=GITHUB_API,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.get(
+                f"/repos/{owner}/{repository}/git/trees/{quote(ref, safe='')}",
+                params={"recursive": "1"},
+            )
+            _raise_for_github_error(response)
+            payload = response.json()
+
+        if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+            raise GitHubAPIError(
+                "github_api_error",
+                "GitHub returned an unexpected repository tree. Try again shortly.",
+                502,
+            )
+        entries = [RepositoryTreeEntry.model_validate(entry) for entry in payload["tree"]]
+        return entries, payload.get("truncated") is True
+    except httpx.TimeoutException as error:
+        raise GitHubAPIError(
+            "github_timeout",
+            "GitHub took too long to return the repository tree. Try again shortly.",
+            504,
+        ) from error
+    except httpx.RequestError as error:
+        raise GitHubAPIError(
+            "github_unavailable",
+            "DevPilot could not reach GitHub. Check your connection and try again.",
+            502,
+        ) from error
+    except (ValueError, ValidationError) as error:
+        raise GitHubAPIError(
+            "github_api_error",
+            "GitHub returned an unexpected repository tree. Try again shortly.",
+            502,
+        ) from error
+
+
 def _validate_file_reference(owner: str, repository: str, path: str) -> None:
     if (
         not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", owner)

@@ -3,8 +3,21 @@
 DevPilot is an AI-assisted developer workspace for inspecting public GitHub
 repositories and asking questions about selected source files. It retrieves
 repository metadata and file contents through the GitHub REST API; it does not
-clone repositories or execute repository code. Codebase Q&A sends the selected
-file and question to Gemini from the backend.
+clone repositories or execute repository code. Codebase Q&A sends source and
+questions to Gemini from the backend.
+
+## Codebase Q&A
+
+After selecting a source file, ask about that file alone or enable **Include up
+to 3 direct relative imports** to ask in related-files mode. Related mode checks
+only direct relative JavaScript/TypeScript imports and re-exports from the
+selected file; it does not traverse imports recursively or resolve TypeScript
+path aliases. The selected file plus related files are limited to four files
+total, 128 KiB per file, and 256 KiB of source context, with a 30-second
+discovery/fetch deadline. DevPilot displays which source paths were included
+and marks context as limited when imports cannot be resolved, the tree is
+truncated, or a limit is reached. Citation ranges are checked against supplied
+source lines, but that check does not prove that a cited line supports a claim.
 
 ## Requirements
 
@@ -65,11 +78,12 @@ cd backend
 .venv/bin/python -m unittest discover -s tests
 ```
 
-Run the frontend lint, TypeScript, and Markdown parser tests:
+Run frontend lint, TypeScript, Markdown parser, and repository-question helper
+tests:
 
 ```bash
 cd frontend
 npm run lint
 npx tsc --noEmit
-node --experimental-strip-types --test tests/markdown.test.mjs
+node --experimental-strip-types --test tests/markdown.test.mjs tests/repository-question.test.mjs
 ```

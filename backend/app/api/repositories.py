@@ -8,7 +8,10 @@ from app.schemas.repository import (
     RepositoryFileResponse,
     RepositoryQuestionRequest,
     RepositoryQuestionResponse,
+    RelatedRepositoryQuestionResponse,
+    RelatedSource,
 )
+from app.services.code_context import build_related_context
 from app.services.github import (
     GitHubAPIError,
     InvalidRepositoryURL,
@@ -18,6 +21,7 @@ from app.services.github import (
 from app.services.gemini import (
     GeminiAPIError,
     answer_about_source,
+    answer_about_sources,
     validate_gemini_configuration,
 )
 
@@ -144,6 +148,69 @@ async def ask_about_repository_file(
         )
         answer = await answer_about_source(repository, path, content, question)
         return RepositoryQuestionResponse(repository=repository, path=path, answer=answer)
+    except GitHubAPIError as error:
+        return _error_response(
+            error.status_code,
+            error.code,
+            error.message,
+            error.retry_after_seconds,
+        )
+    except GeminiAPIError as error:
+        return _error_response(error.status_code, error.code, error.message)
+
+
+@router.post(
+    "/repositories/ask-related",
+    response_model=RelatedRepositoryQuestionResponse,
+    responses={
+        404: {"description": "Repository or file is missing or not public"},
+        413: {"description": "Selected source file exceeds the supported size"},
+        415: {"description": "Selected file is not supported text"},
+        429: {"description": "GitHub rate limit reached"},
+        502: {"description": "GitHub or Gemini API error"},
+        503: {"description": "Gemini is not configured or unavailable"},
+        504: {"description": "GitHub or Gemini API timeout"},
+    },
+)
+async def ask_about_related_files(
+    request: RepositoryQuestionRequest,
+) -> RelatedRepositoryQuestionResponse | JSONResponse:
+    question = request.question.strip()
+    if not question:
+        return _error_response(422, "invalid_question", "Enter a question about these files.")
+
+    try:
+        validate_gemini_configuration()
+        # Related context retrieval fetches the selected file itself so that its
+        # content, tree ref, and all budget checks share one bounded operation.
+        context = await build_related_context(
+            request.owner,
+            request.repository,
+            request.path,
+            request.ref,
+        )
+        repository = f"{request.owner}/{request.repository}"
+        answer = await answer_about_sources(
+            repository,
+            [(source.source_id, source.path, source.content) for source in context.sources],
+            question,
+        )
+        selected = context.sources[0]
+        return RelatedRepositoryQuestionResponse(
+            repository=repository,
+            path=selected.path,
+            answer=answer,
+            sources=[
+                RelatedSource(
+                    source_id=source.source_id,
+                    path=source.path,
+                    size_bytes=source.size_bytes,
+                )
+                for source in context.sources
+            ],
+            context_complete=context.complete,
+            context_message=context.message,
+        )
     except GitHubAPIError as error:
         return _error_response(
             error.status_code,

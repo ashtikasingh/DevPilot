@@ -41,7 +41,12 @@ backend/.venv/bin/python -m pip install -r backend/requirements.txt
 Set `GEMINI_API_KEY` in the process environment or in `backend/.env`. The local
 `.env` file is ignored by Git. The backend loads that file without overriding a
 key already present in the process environment. `GEMINI_MODEL` is optional; the
-backend uses its configured default when it is unset.
+backend uses its configured default when it is unset. `GITHUB_TOKEN` is also
+optional and backend-only; when configured, DevPilot uses it for GitHub REST API
+requests while still inspecting public repositories only. Without it, GitHub
+requests remain unauthenticated and subject to the public API rate limit. Add
+the token to `backend/.env` or the backend process environment; never place it
+in a `NEXT_PUBLIC_*` variable.
 
 Start the API from the project root:
 

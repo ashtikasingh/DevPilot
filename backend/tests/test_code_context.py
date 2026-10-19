@@ -15,7 +15,7 @@ class RelatedContextTests(unittest.IsolatedAsyncioTestCase):
     def setup_context(self, seed, files, tree, failures=None):
         failures = failures or {}
 
-        async def fetch_file(owner, repository, path, ref=None):
+        async def fetch_file(owner, repository, path, ref=None, repository_public_verified=False):
             if path in failures:
                 raise failures[path]
             content = files[path]

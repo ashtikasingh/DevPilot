@@ -1,8 +1,11 @@
 import asyncio
 import logging
+import math
 import os
 import re
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -16,11 +19,17 @@ GEMINI_POOL_TIMEOUT_SECONDS = 10.0
 GEMINI_MAX_RETRIES = 1
 GEMINI_RETRY_BASE_DELAY_SECONDS = 0.25
 GEMINI_RETRYABLE_STATUS_CODES = frozenset({502, 503, 504})
-DEFAULT_MAX_OUTPUT_TOKENS = 1024
-RELATED_MAX_OUTPUT_TOKENS = 2048
+DEFAULT_MAX_OUTPUT_TOKENS = 2048
+RELATED_MAX_OUTPUT_TOKENS = 3072
 LOGGER = logging.getLogger(__name__)
 PROVIDER_STATUS_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 EXCEPTION_CLASS_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9]{0,63}")
+RETRY_DELAY_PATTERN = re.compile(r"^(\d+(?:\.\d{1,9})?)s$")
+MAX_RETRY_HINT_SECONDS = 30 * 24 * 60 * 60
+MAX_RETRY_HINT_TEXT_LENGTH = 64
+FINISH_REASON_CATEGORIES = frozenset(
+    {"STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "OTHER"}
+)
 NUMBERED_SOURCE_LINE_PATTERN = re.compile(r"^(\d+) \| ")
 LINE_CITATION_PATTERN = re.compile(r"^L(\d+)(?:-L(\d+))?$")
 LINE_CITATION_CANDIDATE_PATTERN = re.compile(r"\[(L(?:[0-9-][^\]\n]*|x))\]")
@@ -62,6 +71,69 @@ def _safe_provider_error_metadata(response: httpx.Response) -> tuple[str | None,
     return provider_status, provider_code
 
 
+def _retry_hint(
+    response: httpx.Response,
+    now: datetime | None = None,
+) -> tuple[int | None, str]:
+    """Extract bounded retry timing and its normalized source from a 429."""
+    retry_after = response.headers.get("Retry-After", "").strip()
+    if len(retry_after) <= MAX_RETRY_HINT_TEXT_LENGTH and retry_after.isdigit():
+        try:
+            seconds = int(retry_after)
+        except (ValueError, OverflowError):
+            seconds = None
+        if seconds is not None and 0 <= seconds <= MAX_RETRY_HINT_SECONDS:
+            return seconds, "retry_after_header"
+    elif retry_after and len(retry_after) <= MAX_RETRY_HINT_TEXT_LENGTH:
+        try:
+            retry_at = parsedate_to_datetime(retry_after)
+            current_time = now or datetime.now(timezone.utc)
+            if retry_at.tzinfo is not None and current_time.tzinfo is not None:
+                seconds = max(
+                    0,
+                    math.ceil(
+                        (retry_at.astimezone(timezone.utc)
+                         - current_time.astimezone(timezone.utc)).total_seconds()
+                    ),
+                )
+                if seconds <= MAX_RETRY_HINT_SECONDS:
+                    return seconds, "retry_after_header"
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return None, "none"
+    if not isinstance(payload, dict):
+        return None, "none"
+    error = payload.get("error")
+    details = error.get("details") if isinstance(error, dict) else None
+    if not isinstance(details, list):
+        return None, "none"
+
+    for detail in details:
+        if not isinstance(detail, dict) or detail.get("@type") != "type.googleapis.com/google.rpc.RetryInfo":
+            continue
+        retry_delay = detail.get("retryDelay")
+        if (
+            not isinstance(retry_delay, str)
+            or len(retry_delay) > MAX_RETRY_HINT_TEXT_LENGTH
+        ):
+            return None, "none"
+        match = RETRY_DELAY_PATTERN.fullmatch(retry_delay)
+        if match is None:
+            return None, "none"
+        try:
+            seconds = math.ceil(float(match.group(1)))
+        except (ValueError, OverflowError):
+            return None, "none"
+        if 0 < seconds <= MAX_RETRY_HINT_SECONDS:
+            return seconds, "retry_info"
+        return None, "none"
+    return None, "none"
+
+
 def _http_error_category(status_code: int) -> str:
     if status_code == 429:
         return "rate_limited"
@@ -79,15 +151,38 @@ def _safe_exception_class(error: Exception) -> str:
     return name if EXCEPTION_CLASS_PATTERN.fullmatch(name) else "RequestError"
 
 
-def _log_http_failure(response: httpx.Response, elapsed_ms: int) -> None:
+def _safe_finish_reason(value: object) -> str:
+    if not isinstance(value, str):
+        return "missing"
+    return value.lower() if value in FINISH_REASON_CATEGORIES else "other"
+
+
+def _safe_token_count(payload: dict, field: str) -> str:
+    usage = payload.get("usageMetadata")
+    if not isinstance(usage, dict):
+        return "-"
+    value = usage.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 1_000_000_000:
+        return "-"
+    return str(value)
+
+
+def _log_http_failure(
+    response: httpx.Response,
+    elapsed_ms: int,
+    retry_after_seconds: int | None = None,
+    retry_source: str = "none",
+) -> None:
     provider_status, provider_code = _safe_provider_error_metadata(response)
     LOGGER.warning(
-        "Gemini request failed http_status=%d error_category=%s elapsed_ms=%d provider_status=%s provider_code=%s",
+        "Gemini request failed http_status=%d error_category=%s elapsed_ms=%d provider_status=%s provider_code=%s retry_after_seconds=%s retry_source=%s",
         response.status_code,
         _http_error_category(response.status_code),
         elapsed_ms,
         provider_status or "-",
         str(provider_code) if provider_code is not None else "-",
+        str(retry_after_seconds) if retry_after_seconds is not None else "-",
+        retry_source,
     )
 
 
@@ -126,7 +221,7 @@ def _sanitize_citation_text(text: str, valid_line_numbers: set[int]) -> str:
 
         citation = LINE_CITATION_PATTERN.fullmatch(match.group(1))
         if citation is None:
-            return "[line reference could not be verified]"
+            return "[citation syntax or line range could not be verified]"
 
         start = int(citation.group(1))
         end = int(citation.group(2) or start)
@@ -135,7 +230,7 @@ def _sanitize_citation_text(text: str, valid_line_numbers: set[int]) -> str:
             or start not in valid_line_numbers
             or end not in valid_line_numbers
         ):
-            return "[line reference could not be verified]"
+            return "[citation syntax or line range could not be verified]"
         return match.group(0)
 
     return LINE_CITATION_CANDIDATE_PATTERN.sub(replace_candidate, text)
@@ -352,15 +447,23 @@ async def _request_gemini_answer(
         ) from error
 
     elapsed_ms = int((time.perf_counter() - request_started) * 1000)
-    if response.status_code >= 400:
-        _log_http_failure(response, elapsed_ms)
-
     if response.status_code == 429:
+        retry_after_seconds, retry_source = _retry_hint(response)
+        _log_http_failure(response, elapsed_ms, retry_after_seconds, retry_source)
+        if retry_after_seconds is not None:
+            message = f"Gemini is rate limiting requests. Try again in about {retry_after_seconds} seconds."
+        else:
+            message = (
+                "Gemini is rate limiting requests, but did not provide a reliable retry time. "
+                "Check your Gemini API quota and try again later."
+            )
         raise GeminiAPIError(
             "gemini_rate_limited",
-            "Gemini is rate limiting requests. Wait briefly, then try again.",
+            message,
             503,
         )
+    if response.status_code >= 400:
+        _log_http_failure(response, elapsed_ms)
     if response.status_code in (401, 403):
         raise GeminiAPIError(
             "gemini_configuration_error",
@@ -387,8 +490,13 @@ async def _request_gemini_answer(
             raise TypeError("Expected a string finish reason")
         if finish_reason == "MAX_TOKENS":
             LOGGER.warning(
-                "Gemini response incomplete http_status=%d error_category=max_tokens elapsed_ms=%d",
+                "Gemini response incomplete http_status=%d error_category=max_tokens finish_reason=%s output_token_limit=%d prompt_tokens=%s candidate_tokens=%s total_tokens=%s elapsed_ms=%d",
                 response.status_code,
+                _safe_finish_reason(finish_reason),
+                max_output_tokens,
+                _safe_token_count(payload, "promptTokenCount"),
+                _safe_token_count(payload, "candidatesTokenCount"),
+                _safe_token_count(payload, "totalTokenCount"),
                 elapsed_ms,
             )
             raise GeminiAPIError(
@@ -422,8 +530,12 @@ async def _request_gemini_answer(
 
     if not answer:
         LOGGER.warning(
-            "Gemini response contained no answer http_status=%d error_category=empty_answer elapsed_ms=%d",
+            "Gemini response contained no answer http_status=%d error_category=empty_answer finish_reason=%s prompt_tokens=%s candidate_tokens=%s total_tokens=%s elapsed_ms=%d",
             response.status_code,
+            _safe_finish_reason(finish_reason),
+            _safe_token_count(payload, "promptTokenCount"),
+            _safe_token_count(payload, "candidatesTokenCount"),
+            _safe_token_count(payload, "totalTokenCount"),
             elapsed_ms,
         )
         raise GeminiAPIError(

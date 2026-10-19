@@ -66,10 +66,10 @@ class GeminiResponseTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             answer,
-            "Bad [line reference could not be verified] and "
-            "[line reference could not be verified], "
-            "reversed [line reference could not be verified], "
-            "missing [line reference could not be verified].",
+            "Bad [citation syntax or line range could not be verified] and "
+            "[citation syntax or line range could not be verified], "
+            "reversed [citation syntax or line range could not be verified], "
+            "missing [citation syntax or line range could not be verified].",
         )
 
     async def test_citations_in_code_and_unrelated_numeric_text_are_unchanged(self):
@@ -89,7 +89,7 @@ class GeminiResponseTests(unittest.IsolatedAsyncioTestCase):
         answer = await self.ask_with_response(candidate_response("Complete answer."))
         self.assertEqual(answer, "Complete answer.")
 
-    async def test_single_file_mode_keeps_1024_output_token_limit(self):
+    async def test_single_file_mode_uses_2048_output_token_limit(self):
         client = FakeAsyncClient(provider_response(candidate_response("Complete answer.")))
         with (
             patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
@@ -99,7 +99,9 @@ class GeminiResponseTests(unittest.IsolatedAsyncioTestCase):
                 "owner/repo", "file.tsx", "const answer = 42;", "Explain this file"
             )
 
-        self.assertEqual(client.request_bodies[0]["generationConfig"]["maxOutputTokens"], 1024)
+        self.assertEqual(
+            client.request_bodies[0]["generationConfig"]["maxOutputTokens"], 2048
+        )
 
     async def test_max_tokens_is_reported_as_safe_incomplete_response(self):
         with self.assertRaises(gemini.GeminiAPIError) as raised:
@@ -111,6 +113,26 @@ class GeminiResponseTests(unittest.IsolatedAsyncioTestCase):
             raised.exception.message,
             "Gemini's answer was cut short. Try a more focused question.",
         )
+
+    async def test_max_tokens_diagnostics_include_only_safe_counts(self):
+        payload = candidate_response("private source and question", "MAX_TOKENS")
+        payload["usageMetadata"] = {
+            "promptTokenCount": 120,
+            "candidatesTokenCount": 2048,
+            "totalTokenCount": 2168,
+        }
+        with self.assertLogs(gemini.LOGGER, level="WARNING") as captured:
+            with self.assertRaises(gemini.GeminiAPIError):
+                await self.ask_with_response(payload)
+
+        logs = "\n".join(captured.output)
+        self.assertIn("finish_reason=max_tokens", logs)
+        self.assertIn("output_token_limit=2048", logs)
+        self.assertIn("prompt_tokens=120", logs)
+        self.assertIn("candidate_tokens=2048", logs)
+        self.assertIn("total_tokens=2168", logs)
+        self.assertNotIn("private source", logs)
+        self.assertNotIn("question", logs)
 
     async def test_empty_content_uses_existing_safe_error(self):
         with self.assertRaises(gemini.GeminiAPIError) as raised:

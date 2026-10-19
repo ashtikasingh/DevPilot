@@ -508,6 +508,11 @@ export default function RepositoryImportPanel() {
                         </p>
                       </>
                     )}
+                    {!answer.sources && (
+                      <p className="citation-validation-note">
+                        Citation syntax and line ranges are checked, but citations are not automatically verified to support every claim.
+                      </p>
+                    )}
                     <MarkdownAnswer content={answer.answer} />
                   </div>
                 )}

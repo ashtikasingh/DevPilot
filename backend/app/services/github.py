@@ -1,7 +1,8 @@
-import re
-import time
 import base64
 import binascii
+import os
+import re
+import time
 from urllib.parse import quote, unquote, urlsplit
 
 import httpx
@@ -17,6 +18,13 @@ GITHUB_API = "https://api.github.com"
 GITHUB_API_VERSION = "2022-11-28"
 REQUEST_TIMEOUT_SECONDS = 12.0
 MAX_SOURCE_FILE_BYTES = 128 * 1024
+TREE_CACHE_TTL_SECONDS = 30.0
+TREE_CACHE_MAX_ENTRIES = 8
+TREE_CACHE_MAX_PATH_BYTES = 512 * 1024
+_TREE_CACHE: dict[
+    tuple[str, str, str],
+    tuple[float, tuple[RepositoryTreeEntry, ...], bool],
+] = {}
 
 
 class InvalidRepositoryURL(Exception):
@@ -36,6 +44,72 @@ class GitHubAPIError(Exception):
         self.message = message
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
+
+
+def _github_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        "User-Agent": "DevPilot-Repository-Inspector",
+    }
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _github_token_configured() -> bool:
+    return bool(os.environ.get("GITHUB_TOKEN", "").strip())
+
+
+def _require_public_repository(payload: object) -> None:
+    if not isinstance(payload, dict) or payload.get("private") is not False:
+        raise GitHubAPIError(
+            "repository_not_found",
+            "Repository was not found or is not public. Check the URL and repository visibility.",
+            404,
+        )
+
+
+def _tree_cache_key(owner: str, repository: str, ref: str) -> tuple[str, str, str]:
+    return owner.lower(), repository.lower(), ref
+
+
+def _cached_repository_tree(
+    owner: str,
+    repository: str,
+    ref: str,
+) -> tuple[list[RepositoryTreeEntry], bool] | None:
+    key = _tree_cache_key(owner, repository, ref)
+    cached = _TREE_CACHE.get(key)
+    if cached is None:
+        return None
+    expires_at, entries, truncated = cached
+    if expires_at <= time.monotonic():
+        del _TREE_CACHE[key]
+        return None
+    return list(entries), truncated
+
+
+def _cache_repository_tree(
+    owner: str,
+    repository: str,
+    ref: str,
+    entries: list[RepositoryTreeEntry],
+    truncated: bool,
+) -> None:
+    path_bytes = sum(len(entry.path.encode("utf-8")) for entry in entries)
+    if len(entries) > 5000 or path_bytes > TREE_CACHE_MAX_PATH_BYTES:
+        return
+
+    key = _tree_cache_key(owner, repository, ref)
+    if key not in _TREE_CACHE and len(_TREE_CACHE) >= TREE_CACHE_MAX_ENTRIES:
+        del _TREE_CACHE[next(iter(_TREE_CACHE))]
+    _TREE_CACHE[key] = (
+        time.monotonic() + TREE_CACHE_TTL_SECONDS,
+        tuple(entries),
+        truncated,
+    )
 
 
 def parse_repository_url(repository_url: str) -> tuple[str, str]:
@@ -105,15 +179,20 @@ def _raise_for_github_error(
         response.status_code == 429
         or remaining == "0"
         or "rate limit" in str(upstream_message).lower()
-        or response.headers.get("Retry-After") is not None
     )
 
     if is_rate_limited:
+        retry_after_seconds = _rate_limit_delay(response)
+        message = "GitHub API rate limit reached."
+        if retry_after_seconds is not None:
+            message += f" Try again in about {retry_after_seconds} seconds."
+        else:
+            message += " Check the rate-limit reset time before retrying."
         raise GitHubAPIError(
             "github_rate_limited",
-            "GitHub's public API rate limit has been reached. Try again after the indicated wait.",
+            message,
             429,
-            _rate_limit_delay(response),
+            retry_after_seconds,
         )
 
     if response.status_code == 404:
@@ -139,11 +218,7 @@ def _raise_for_github_error(
 
 async def inspect_public_repository(repository_url: str) -> InspectRepositoryResponse:
     owner, repository = parse_repository_url(repository_url)
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        "User-Agent": "DevPilot-Repository-Inspector",
-    }
+    headers = _github_headers()
 
     try:
         async with httpx.AsyncClient(
@@ -155,7 +230,9 @@ async def inspect_public_repository(repository_url: str) -> InspectRepositoryRes
             _raise_for_github_error(metadata_response)
             metadata_payload = metadata_response.json()
 
-            if not isinstance(metadata_payload, dict) or metadata_payload.get("private") is True:
+            if _github_token_configured():
+                _require_public_repository(metadata_payload)
+            elif not isinstance(metadata_payload, dict) or metadata_payload.get("private") is True:
                 raise GitHubAPIError(
                     "repository_not_found",
                     "Repository was not found or is not public. Check the URL and repository visibility.",
@@ -180,6 +257,7 @@ async def inspect_public_repository(repository_url: str) -> InspectRepositoryRes
 
         entries = [RepositoryTreeEntry.model_validate(entry) for entry in tree_payload["tree"]]
         truncated = tree_payload.get("truncated") is True
+        _cache_repository_tree(owner, repository, metadata.default_branch, entries, truncated)
 
         return InspectRepositoryResponse(
             repository=metadata,
@@ -216,6 +294,7 @@ async def fetch_public_repository_tree(
     owner: str,
     repository: str,
     ref: str,
+    repository_public_verified: bool = False,
 ) -> tuple[list[RepositoryTreeEntry], bool]:
     _validate_file_reference(owner, repository, "tree")
     if not isinstance(ref, str) or not ref or len(ref) > 255:
@@ -225,17 +304,27 @@ async def fetch_public_repository_tree(
             422,
         )
 
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        "User-Agent": "DevPilot-Repository-Inspector",
-    }
+    headers = _github_headers()
+    cached_tree = _cached_repository_tree(owner, repository, ref)
+    if cached_tree is not None and (
+        "Authorization" not in headers or repository_public_verified
+    ):
+        return cached_tree
+
     try:
         async with httpx.AsyncClient(
             base_url=GITHUB_API,
             headers=headers,
             timeout=REQUEST_TIMEOUT_SECONDS,
         ) as client:
+            if "Authorization" in headers and not repository_public_verified:
+                metadata_response = await client.get(f"/repos/{owner}/{repository}")
+                _raise_for_github_error(metadata_response)
+                _require_public_repository(metadata_response.json())
+
+            if cached_tree is not None:
+                return cached_tree
+
             response = await client.get(
                 f"/repos/{owner}/{repository}/git/trees/{quote(ref, safe='')}",
                 params={"recursive": "1"},
@@ -250,7 +339,9 @@ async def fetch_public_repository_tree(
                 502,
             )
         entries = [RepositoryTreeEntry.model_validate(entry) for entry in payload["tree"]]
-        return entries, payload.get("truncated") is True
+        truncated = payload.get("truncated") is True
+        _cache_repository_tree(owner, repository, ref, entries, truncated)
+        return entries, truncated
     except httpx.TimeoutException as error:
         raise GitHubAPIError(
             "github_timeout",
@@ -292,13 +383,10 @@ async def fetch_public_file_content(
     repository: str,
     path: str,
     ref: str | None = None,
+    repository_public_verified: bool = False,
 ) -> tuple[str, str, str, str, int]:
     _validate_file_reference(owner, repository, path)
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        "User-Agent": "DevPilot-Repository-Inspector",
-    }
+    headers = _github_headers()
 
     try:
         async with httpx.AsyncClient(
@@ -306,7 +394,8 @@ async def fetch_public_file_content(
             headers=headers,
             timeout=REQUEST_TIMEOUT_SECONDS,
         ) as client:
-            if ref is None:
+            needs_public_check = _github_token_configured() and not repository_public_verified
+            if ref is None or needs_public_check:
                 metadata_response = await client.get(f"/repos/{owner}/{repository}")
                 _raise_for_github_error(metadata_response)
                 metadata_payload = metadata_response.json()
@@ -316,7 +405,10 @@ async def fetch_public_file_content(
                         "Repository was not found or is not public. Check its visibility.",
                         404,
                     )
-                ref = metadata_payload.get("default_branch")
+                if needs_public_check:
+                    _require_public_repository(metadata_payload)
+                if ref is None:
+                    ref = metadata_payload.get("default_branch")
             if not isinstance(ref, str) or not ref or len(ref) > 255:
                 raise GitHubAPIError(
                     "invalid_file_reference",

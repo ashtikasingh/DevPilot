@@ -89,7 +89,7 @@ class GeminiSourceContextTests(unittest.IsolatedAsyncioTestCase):
         request = client.request_bodies[0]
         system_instruction = request["systemInstruction"]["parts"][0]["text"]
 
-        self.assertEqual(request["generationConfig"]["maxOutputTokens"], 2048)
+        self.assertEqual(request["generationConfig"]["maxOutputTokens"], 3072)
         self.assertIn("Answer the specific question directly in concise Markdown", system_instruction)
         self.assertIn("identify the responsible included file by its source ID and path", system_instruction)
         self.assertIn("Avoid broad repository summaries and repeated explanations", system_instruction)

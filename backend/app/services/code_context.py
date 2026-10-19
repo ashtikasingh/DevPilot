@@ -202,7 +202,7 @@ async def build_related_context(
             reasons: list[str] = []
 
             tree_entries, tree_truncated = await fetch_public_repository_tree(
-                owner, repository, resolved_ref
+                owner, repository, resolved_ref, repository_public_verified=True
             )
             if tree_truncated:
                 complete = False
@@ -239,7 +239,11 @@ async def build_related_context(
 
                 try:
                     _, related_path, _, content, size_bytes = await fetch_public_file_content(
-                        owner, repository, candidate, resolved_ref
+                        owner,
+                        repository,
+                        candidate,
+                        resolved_ref,
+                        repository_public_verified=True,
                     )
                 except GitHubAPIError as error:
                     if error.status_code in (404, 413, 415, 422):

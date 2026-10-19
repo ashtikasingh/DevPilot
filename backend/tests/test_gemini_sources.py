@@ -95,6 +95,62 @@ class GeminiSourceContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Avoid broad repository summaries and repeated explanations", system_instruction)
         self.assertIn("[F1:L12] or [F2:L12-L18]", system_instruction)
 
+    async def test_citation_instructions_list_only_actual_source_ids_and_paths(self):
+        _answer, client = await self.ask(
+            "Explain the supplied files.",
+            source_list=[
+                ("F1", "src/page.ts", "entry point"),
+                ("F2", "src/helper.ts", "helper"),
+            ],
+        )
+        system_instruction = client.request_bodies[0]["systemInstruction"]["parts"][0]["text"]
+
+        self.assertIn(
+            'Only these included source IDs and repository-relative paths may be cited: '
+            'F1 ("src/page.ts"), '
+            'F2 ("src/helper.ts").',
+            system_instruction,
+        )
+        self.assertNotIn('F3 ("', system_instruction)
+        self.assertNotIn('F4 ("', system_instruction)
+        self.assertIn("Each file has independent 1-based line numbers", system_instruction)
+        self.assertIn("Do not invent source IDs or line references", system_instruction)
+
+    async def test_incomplete_context_instructs_a_limitation_without_fabricated_citation(self):
+        answer, client = await self.ask(
+            "The supplied files do not establish where the caller is implemented.",
+            source_list=[("F1", "src/page.ts", "entry point without its imported helper")],
+        )
+        system_instruction = client.request_bodies[0]["systemInstruction"]["parts"][0]["text"]
+
+        self.assertIn(
+            "If a claim cannot be supported by the supplied context, state that limitation "
+            "without fabricating a citation",
+            system_instruction,
+        )
+        self.assertIn("Do not assume unlisted files are available", system_instruction)
+        self.assertIn(
+            'Only these included source IDs and repository-relative paths may be cited: '
+            'F1 ("src/page.ts").',
+            system_instruction,
+        )
+        self.assertNotIn('F2 ("', system_instruction)
+        self.assertEqual(answer, "The supplied files do not establish where the caller is implemented.")
+
+    async def test_missing_source_context_returns_safe_error_without_provider_request(self):
+        with (
+            patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}),
+            patch.object(
+                gemini.httpx,
+                "AsyncClient",
+                side_effect=AssertionError("No provider request should be made"),
+            ),
+        ):
+            with self.assertRaises(gemini.GeminiAPIError) as raised:
+                await gemini.answer_about_sources("owner/repo", [], "question")
+
+        self.assertEqual(raised.exception.code, "gemini_empty_context")
+
     async def test_valid_file_line_citations_are_preserved(self):
         answer, _ = await self.ask("Uses the helper [F2:L1-L2] and entry [F1:L2].")
         self.assertEqual(answer, "Uses the helper [F2:L1-L2] and entry [F1:L2].")
@@ -172,6 +228,14 @@ class GeminiSourceContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("malformed_syntax=1", diagnostics)
         self.assertIn("unknown_source_id=1", diagnostics)
         self.assertIn("invalid_line_range=2", diagnostics)
+
+    async def test_literal_unverified_reference_phrase_from_provider_is_preserved(self):
+        provider_text = "[source reference could not be verified]"
+
+        with self.assertNoLogs(gemini.LOGGER, level="INFO"):
+            answer, _ = await self.ask(provider_text)
+
+        self.assertEqual(answer, provider_text)
 
     async def test_line_87_is_valid_for_the_third_source_and_keeps_its_mapping(self):
         source_list = [

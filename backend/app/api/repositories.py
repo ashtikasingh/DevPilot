@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.schemas.repository import (
@@ -24,6 +24,7 @@ from app.services.gemini import (
     answer_about_sources,
     validate_gemini_configuration,
 )
+from app.services.rate_limit import qa_rate_limit_settings, qa_request_limiter
 
 router = APIRouter(tags=["repositories"])
 
@@ -46,6 +47,22 @@ def _error_response(
         status_code=status_code,
         content={"error": error},
         headers=headers,
+    )
+
+
+def _qa_rate_limit_response(request: Request) -> JSONResponse | None:
+    limit, window_seconds = qa_rate_limit_settings()
+    client_host = request.client.host if request.client is not None else "unknown"
+    retry_after = qa_request_limiter.consume(
+        client_host[:128], limit, window_seconds
+    )
+    if retry_after is None:
+        return None
+    return _error_response(
+        429,
+        "qa_rate_limited",
+        "Too many Q&A requests. Wait briefly, then try again.",
+        retry_after,
     )
 
 
@@ -125,7 +142,7 @@ async def get_repository_file(
         404: {"description": "Repository or file is missing or not public"},
         413: {"description": "Source file exceeds the supported size"},
         415: {"description": "File is not supported text"},
-        429: {"description": "GitHub rate limit reached"},
+        429: {"description": "GitHub or Q&A rate limit reached"},
         502: {"description": "GitHub or Gemini API error"},
         503: {"description": "Gemini is not configured or unavailable"},
         504: {"description": "GitHub or Gemini API timeout"},
@@ -133,10 +150,14 @@ async def get_repository_file(
 )
 async def ask_about_repository_file(
     request: RepositoryQuestionRequest,
+    http_request: Request,
 ) -> RepositoryQuestionResponse | JSONResponse:
     question = request.question.strip()
     if not question:
         return _error_response(422, "invalid_question", "Enter a question about this file.")
+    rate_limit_response = _qa_rate_limit_response(http_request)
+    if rate_limit_response is not None:
+        return rate_limit_response
 
     try:
         validate_gemini_configuration()
@@ -166,7 +187,7 @@ async def ask_about_repository_file(
         404: {"description": "Repository or file is missing or not public"},
         413: {"description": "Selected source file exceeds the supported size"},
         415: {"description": "Selected file is not supported text"},
-        429: {"description": "GitHub rate limit reached"},
+        429: {"description": "GitHub or Q&A rate limit reached"},
         502: {"description": "GitHub or Gemini API error"},
         503: {"description": "Gemini is not configured or unavailable"},
         504: {"description": "GitHub or Gemini API timeout"},
@@ -174,10 +195,14 @@ async def ask_about_repository_file(
 )
 async def ask_about_related_files(
     request: RepositoryQuestionRequest,
+    http_request: Request,
 ) -> RelatedRepositoryQuestionResponse | JSONResponse:
     question = request.question.strip()
     if not question:
         return _error_response(422, "invalid_question", "Enter a question about these files.")
+    rate_limit_response = _qa_rate_limit_response(http_request)
+    if rate_limit_response is not None:
+        return rate_limit_response
 
     try:
         validate_gemini_configuration()

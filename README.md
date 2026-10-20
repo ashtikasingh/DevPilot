@@ -48,6 +48,23 @@ requests remain unauthenticated and subject to the public API rate limit. Add
 the token to `backend/.env` or the backend process environment; never place it
 in a `NEXT_PUBLIC_*` variable.
 
+For deployment, set `CORS_ALLOWED_ORIGINS` in the backend environment to a
+comma-separated list of exact browser origins, for example
+`https://devpilot.example,https://devpilot-preview.example`. Whitespace and
+empty entries are ignored; wildcard origins are rejected. If unset or empty,
+the local development origins above are used. Keep the list limited to the
+frontend's actual HTTPS origins.
+
+The Gemini-backed Q&A routes have a process-local sliding-window limit of 10
+requests per client address per 60 seconds by default. Set
+`GEMINI_QA_RATE_LIMIT` (1–60) and `GEMINI_QA_RATE_WINDOW_SECONDS` (1–3600) to
+adjust it; invalid or out-of-range values use the defaults. Requests over the
+limit receive HTTP 429 and a `Retry-After` header. This in-memory limit is
+bounded, resets when the backend restarts, and is intended for a single
+backend process; it is not shared across multiple workers or service
+instances. The limiter uses the connection peer address and does not trust
+client-supplied forwarding headers.
+
 Start the API from the project root:
 
 ```bash
@@ -55,6 +72,7 @@ backend/.venv/bin/uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port
 ```
 
 The API documentation is available at <http://127.0.0.1:8000/docs>.
+The health endpoint is <http://127.0.0.1:8000/healthz>.
 
 ### Frontend
 

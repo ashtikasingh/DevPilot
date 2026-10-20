@@ -6,9 +6,28 @@ from app.schemas.repository import RepositoryQuestionRequest, RepositoryQuestion
 from app.services.code_context import ContextSource, RelatedContext
 from app.services.gemini import GeminiAPIError
 from app.services.github import GitHubAPIError
+from app.services.rate_limit import qa_request_limiter
+from starlette.requests import Request
+
+
+def test_request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/",
+            "headers": [],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("127.0.0.1", 12345),
+        }
+    )
 
 
 class RepositoryQuestionRouteTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        qa_request_limiter.clear()
+
     async def test_existing_single_file_endpoint_keeps_its_contract(self):
         request = RepositoryQuestionRequest(
             owner="owner",
@@ -27,7 +46,7 @@ class RepositoryQuestionRouteTests(unittest.IsolatedAsyncioTestCase):
             patch.object(repositories, "answer_about_source", new=AsyncMock(return_value="answer")),
             patch.object(repositories, "build_related_context") as context_builder,
         ):
-            response = await repositories.ask_about_repository_file(request)
+            response = await repositories.ask_about_repository_file(request, test_request())
 
         self.assertIsInstance(response, RepositoryQuestionResponse)
         self.assertEqual(response.model_dump(), {
@@ -58,7 +77,7 @@ class RepositoryQuestionRouteTests(unittest.IsolatedAsyncioTestCase):
             patch.object(repositories, "build_related_context", new=AsyncMock(return_value=context)),
             patch.object(repositories, "answer_about_sources", new=AsyncMock(return_value="answer [F2:L1]")),
         ):
-            response = await repositories.ask_about_related_files(request)
+            response = await repositories.ask_about_related_files(request, test_request())
 
         self.assertEqual(response.model_dump(), {
             "repository": "owner/repo",
@@ -94,7 +113,7 @@ class RepositoryQuestionRouteTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=GeminiAPIError("gemini_timeout", "safe message", 504)),
             ),
         ):
-            response = await repositories.ask_about_related_files(request)
+            response = await repositories.ask_about_related_files(request, test_request())
 
         self.assertEqual(response.status_code, 504)
         self.assertIn(b"safe message", response.body)
@@ -116,7 +135,7 @@ class RepositoryQuestionRouteTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=GitHubAPIError("github_timeout", "safe timeout", 504)),
             ),
         ):
-            response = await repositories.ask_about_related_files(request)
+            response = await repositories.ask_about_related_files(request, test_request())
 
         self.assertEqual(response.status_code, 504)
         self.assertIn(b"safe timeout", response.body)

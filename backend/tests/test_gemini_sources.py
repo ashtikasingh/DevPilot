@@ -116,6 +116,40 @@ class GeminiSourceContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Each file has independent 1-based line numbers", system_instruction)
         self.assertIn("Do not invent source IDs or line references", system_instruction)
 
+    async def test_provider_state_and_value_declarations_get_distinct_citation_guidance(self):
+        _answer, client = await self.ask(
+            "Explain where provider state is initialized and what it exposes.",
+            source_list=[
+                ("F1", "client/src/pages/Dashboard.tsx", "consumer"),
+                ("F3", "client/src/context/AppContext.tsx", "provider declarations"),
+                ("F4", "client/src/types/index.ts", "types"),
+            ],
+        )
+        system_instruction = client.request_bodies[0]["systemInstruction"]["parts"][0]["text"]
+
+        self.assertIn(
+            'Only these included source IDs and repository-relative paths may be cited: '
+            'F1 ("client/src/pages/Dashboard.tsx"), '
+            'F3 ("client/src/context/AppContext.tsx"), '
+            'F4 ("client/src/types/index.ts").',
+            system_instruction,
+        )
+        self.assertIn(
+            "describing where provider state is initialized, cite the relevant useState declaration "
+            "with its actual included source ID and exact 1-based line number or range",
+            system_instruction,
+        )
+        self.assertIn(
+            "describing what the provider exposes to consumers, cite the separate provider value "
+            "declaration using its actual included source ID and exact 1-based line number or range",
+            system_instruction,
+        )
+        self.assertIn("These are distinct claims and may require distinct citations", system_instruction)
+        self.assertIn(
+            "explicitly say it cannot be verified from the available context without inventing a citation",
+            system_instruction,
+        )
+
     async def test_incomplete_context_instructs_a_limitation_without_fabricated_citation(self):
         answer, client = await self.ask(
             "The supplied files do not establish where the caller is implemented.",

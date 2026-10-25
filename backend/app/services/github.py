@@ -290,6 +290,67 @@ async def inspect_public_repository(repository_url: str) -> InspectRepositoryRes
         ) from error
 
 
+async def verify_public_repository(owner: str, repository: str) -> tuple[str, str]:
+    """Verify public visibility with one metadata-only GitHub request.
+
+    Returns the canonical owner and repository spelling from GitHub metadata.
+    No tree or file content is retrieved.
+    """
+    if (
+        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", owner)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", repository)
+        or repository in {".", ".."}
+    ):
+        raise GitHubAPIError(
+            "invalid_repository",
+            "Enter a valid public GitHub repository.",
+            422,
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            base_url=GITHUB_API,
+            headers=_github_headers(),
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        ) as client:
+            response = await client.get(
+                f"/repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
+            )
+            _raise_for_github_error(response)
+            payload = response.json()
+
+        _require_public_repository(payload)
+        full_name = payload.get("full_name") if isinstance(payload, dict) else None
+        if not isinstance(full_name, str) or full_name.count("/") != 1:
+            raise ValueError("invalid repository metadata")
+        canonical_owner, canonical_repository = full_name.split("/", 1)
+        if (
+            not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", canonical_owner)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", canonical_repository)
+            or canonical_repository in {".", ".."}
+        ):
+            raise ValueError("invalid repository metadata")
+        return canonical_owner, canonical_repository
+    except httpx.TimeoutException as error:
+        raise GitHubAPIError(
+            "github_timeout",
+            "GitHub took too long to verify this repository. Try again shortly.",
+            504,
+        ) from error
+    except httpx.RequestError as error:
+        raise GitHubAPIError(
+            "github_unavailable",
+            "DevPilot could not reach GitHub. Check your connection and try again.",
+            502,
+        ) from error
+    except (ValueError, ValidationError) as error:
+        raise GitHubAPIError(
+            "github_api_error",
+            "GitHub returned unexpected repository metadata. Try again shortly.",
+            502,
+        ) from error
+
+
 async def fetch_public_repository_tree(
     owner: str,
     repository: str,

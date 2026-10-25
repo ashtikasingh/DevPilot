@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.api import repositories
 from app.schemas.repository import RepositoryQuestionRequest, RepositoryQuestionResponse
@@ -39,6 +40,9 @@ class RepositoryQuestionRouteTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(repositories, "validate_gemini_configuration"),
             patch.object(
+                repositories, "relevant_decisions_for_qa", return_value=[]
+            ) as memory_lookup,
+            patch.object(
                 repositories,
                 "fetch_public_file_content",
                 new=AsyncMock(return_value=("owner/repo", "src/page.ts", "main", "source", 6)),
@@ -46,7 +50,9 @@ class RepositoryQuestionRouteTests(unittest.IsolatedAsyncioTestCase):
             patch.object(repositories, "answer_about_source", new=AsyncMock(return_value="answer")),
             patch.object(repositories, "build_related_context") as context_builder,
         ):
-            response = await repositories.ask_about_repository_file(request, test_request())
+            response = await repositories.ask_about_repository_file(
+                request, test_request(), MagicMock()
+            )
 
         self.assertIsInstance(response, RepositoryQuestionResponse)
         self.assertEqual(response.model_dump(), {
@@ -55,6 +61,9 @@ class RepositoryQuestionRouteTests(unittest.IsolatedAsyncioTestCase):
             "answer": "answer",
         })
         context_builder.assert_not_called()
+        memory_lookup.assert_called_once_with(
+            unittest.mock.ANY, "owner", "repo", {"src/page.ts"}
+        )
 
     async def test_related_endpoint_returns_sources_and_partial_coverage(self):
         request = RepositoryQuestionRequest(
@@ -74,10 +83,13 @@ class RepositoryQuestionRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.object(repositories, "validate_gemini_configuration"),
+            patch.object(repositories, "relevant_decisions_for_qa", return_value=[]),
             patch.object(repositories, "build_related_context", new=AsyncMock(return_value=context)),
             patch.object(repositories, "answer_about_sources", new=AsyncMock(return_value="answer [F2:L1]")),
         ):
-            response = await repositories.ask_about_related_files(request, test_request())
+            response = await repositories.ask_about_related_files(
+                request, test_request(), MagicMock()
+            )
 
         self.assertEqual(response.model_dump(), {
             "repository": "owner/repo",
@@ -106,6 +118,7 @@ class RepositoryQuestionRouteTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.object(repositories, "validate_gemini_configuration"),
+            patch.object(repositories, "relevant_decisions_for_qa", return_value=[]),
             patch.object(repositories, "build_related_context", new=AsyncMock(return_value=context)),
             patch.object(
                 repositories,
@@ -113,7 +126,9 @@ class RepositoryQuestionRouteTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=GeminiAPIError("gemini_timeout", "safe message", 504)),
             ),
         ):
-            response = await repositories.ask_about_related_files(request, test_request())
+            response = await repositories.ask_about_related_files(
+                request, test_request(), MagicMock()
+            )
 
         self.assertEqual(response.status_code, 504)
         self.assertIn(b"safe message", response.body)
@@ -139,6 +154,117 @@ class RepositoryQuestionRouteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 504)
         self.assertIn(b"safe timeout", response.body)
+
+    async def test_single_file_memory_read_failure_falls_back_to_code_only_response(self):
+        request = RepositoryQuestionRequest(
+            owner="owner",
+            repository="repo",
+            path="src/page.ts",
+            ref="main",
+            question="Explain this file",
+        )
+        session = MagicMock()
+        with (
+            patch.object(repositories, "validate_gemini_configuration"),
+            patch.object(
+                repositories,
+                "fetch_public_file_content",
+                new=AsyncMock(return_value=("Owner/Repo", "src/page.ts", "main", "source", 6)),
+            ),
+            patch.object(
+                repositories,
+                "relevant_decisions_for_qa",
+                side_effect=SQLAlchemyError("private database details"),
+            ),
+            patch.object(
+                repositories, "answer_about_source", new=AsyncMock(return_value="answer [L1]")
+            ) as answer,
+        ):
+            response = await repositories.ask_about_repository_file(
+                request, test_request(), session
+            )
+
+        self.assertEqual(response.model_dump(), {
+            "repository": "Owner/Repo",
+            "path": "src/page.ts",
+            "answer": "answer [L1]",
+        })
+        self.assertEqual(answer.await_args.kwargs["memory_context"], [])
+        session.rollback.assert_called_once()
+
+    async def test_related_memory_scope_uses_normalized_identity_and_included_paths(self):
+        request = RepositoryQuestionRequest(
+            owner="Owner",
+            repository="Repo",
+            path="src/page.ts",
+            ref="main",
+            question="Explain this",
+        )
+        context = RelatedContext(
+            sources=[
+                ContextSource("F1", "src/page.ts", "selected", 8),
+                ContextSource("F2", "src/helper.ts", "helper", 6),
+            ],
+            complete=True,
+            message=None,
+        )
+        with (
+            patch.object(repositories, "validate_gemini_configuration"),
+            patch.object(repositories, "build_related_context", new=AsyncMock(return_value=context)),
+            patch.object(repositories, "relevant_decisions_for_qa", return_value=[]) as memory_lookup,
+            patch.object(
+                repositories, "answer_about_sources", new=AsyncMock(return_value="answer")
+            ),
+        ):
+            response = await repositories.ask_about_related_files(
+                request, test_request(), MagicMock()
+            )
+
+        self.assertEqual(response.repository, "Owner/Repo")
+        memory_lookup.assert_called_once_with(
+            unittest.mock.ANY, "owner", "repo", {"src/page.ts", "src/helper.ts"}
+        )
+
+    async def test_related_memory_read_failure_falls_back_without_changing_response(self):
+        request = RepositoryQuestionRequest(
+            owner="owner",
+            repository="repo",
+            path="src/page.ts",
+            ref="main",
+            question="Explain this",
+        )
+        context = RelatedContext(
+            sources=[ContextSource("F1", "src/page.ts", "source", 6)],
+            complete=True,
+            message=None,
+        )
+        session = MagicMock()
+        with (
+            patch.object(repositories, "validate_gemini_configuration"),
+            patch.object(repositories, "build_related_context", new=AsyncMock(return_value=context)),
+            patch.object(
+                repositories,
+                "relevant_decisions_for_qa",
+                side_effect=SQLAlchemyError("private database details"),
+            ),
+            patch.object(
+                repositories, "answer_about_sources", new=AsyncMock(return_value="answer [F1:L1]")
+            ) as answer,
+        ):
+            response = await repositories.ask_about_related_files(
+                request, test_request(), session
+            )
+
+        self.assertEqual(response.model_dump(), {
+            "repository": "owner/repo",
+            "path": "src/page.ts",
+            "answer": "answer [F1:L1]",
+            "sources": [{"source_id": "F1", "path": "src/page.ts", "size_bytes": 6}],
+            "context_complete": True,
+            "context_message": None,
+        })
+        self.assertEqual(answer.await_args.kwargs["memory_context"], [])
+        session.rollback.assert_called_once()
 
 
 if __name__ == "__main__":

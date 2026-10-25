@@ -1,5 +1,7 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from app.schemas.repository import (
     InspectRepositoryRequest,
@@ -11,7 +13,9 @@ from app.schemas.repository import (
     RelatedRepositoryQuestionResponse,
     RelatedSource,
 )
+from app.database import get_db
 from app.services.code_context import build_related_context
+from app.services.decision_store import relevant_decisions_for_qa
 from app.services.github import (
     GitHubAPIError,
     InvalidRepositoryURL,
@@ -27,6 +31,33 @@ from app.services.gemini import (
 from app.services.rate_limit import qa_rate_limit_settings, qa_request_limiter
 
 router = APIRouter(tags=["repositories"])
+
+
+def _qa_memory_context(
+    session: Session,
+    repository: str,
+    source_paths: set[str],
+) -> list[dict[str, str | None]]:
+    """Load only bounded decisions for the successfully retrieved repository."""
+    if repository.count("/") != 1:
+        return []
+    owner, name = repository.split("/", 1)
+    if not owner or not name:
+        return []
+    try:
+        return relevant_decisions_for_qa(
+            session,
+            owner.lower(),
+            name.lower(),
+            source_paths,
+        )
+    except SQLAlchemyError:
+        # Memory is optional context. A failed read must not block code Q&A.
+        try:
+            session.rollback()
+        except SQLAlchemyError:
+            pass
+        return []
 
 
 def _error_response(
@@ -151,6 +182,7 @@ async def get_repository_file(
 async def ask_about_repository_file(
     request: RepositoryQuestionRequest,
     http_request: Request,
+    session: Session = Depends(get_db),
 ) -> RepositoryQuestionResponse | JSONResponse:
     question = request.question.strip()
     if not question:
@@ -167,7 +199,10 @@ async def ask_about_repository_file(
             request.path,
             request.ref,
         )
-        answer = await answer_about_source(repository, path, content, question)
+        memory_context = _qa_memory_context(session, repository, {path})
+        answer = await answer_about_source(
+            repository, path, content, question, memory_context=memory_context
+        )
         return RepositoryQuestionResponse(repository=repository, path=path, answer=answer)
     except GitHubAPIError as error:
         return _error_response(
@@ -196,6 +231,7 @@ async def ask_about_repository_file(
 async def ask_about_related_files(
     request: RepositoryQuestionRequest,
     http_request: Request,
+    session: Session = Depends(get_db),
 ) -> RelatedRepositoryQuestionResponse | JSONResponse:
     question = request.question.strip()
     if not question:
@@ -215,10 +251,16 @@ async def ask_about_related_files(
             request.ref,
         )
         repository = f"{request.owner}/{request.repository}"
+        memory_context = _qa_memory_context(
+            session,
+            repository,
+            {source.path for source in context.sources},
+        )
         answer = await answer_about_sources(
             repository,
             [(source.source_id, source.path, source.content) for source in context.sources],
             question,
+            memory_context=memory_context,
         )
         selected = context.sources[0]
         return RelatedRepositoryQuestionResponse(

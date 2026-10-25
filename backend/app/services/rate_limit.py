@@ -92,3 +92,9 @@ class InMemorySlidingWindowLimiter:
 
 
 qa_request_limiter = InMemorySlidingWindowLimiter()
+
+# Decision writes have their own process-local bucket so this feature does not
+# consume or alter the existing Gemini Q&A allowance.
+DECISION_WRITE_RATE_LIMIT = 10
+DECISION_WRITE_RATE_WINDOW_SECONDS = 60
+decision_write_limiter = InMemorySlidingWindowLimiter()

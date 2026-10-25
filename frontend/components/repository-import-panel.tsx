@@ -1,7 +1,16 @@
 "use client";
 
-import { useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
 import { parseMarkdown, type MarkdownBlock, type MarkdownInline } from "@/lib/markdown";
+import DeveloperMemoryPanel from "@/components/developer-memory-panel";
+import {
+  beginRepositoryRequest,
+  clearLastRepository,
+  invalidateRepositoryRequest,
+  isCurrentRepositoryRequest,
+  readLastRepository,
+  saveLastRepository,
+} from "@/lib/last-repository";
 import {
   beginRequest,
   getContextCoverageMessage,
@@ -38,6 +47,7 @@ type RepositoryInspection = {
 
 type ErrorResponse = {
   error?: {
+    code?: string;
     message?: string;
     retry_after_seconds?: number;
   };
@@ -184,6 +194,8 @@ function FileTree({
 
 export default function RepositoryImportPanel() {
   const [repositoryUrl, setRepositoryUrl] = useState("");
+  const [restoreMessage, setRestoreMessage] = useState<string | null>(null);
+  const [isRestoring, setIsRestoring] = useState(false);
   const [inspection, setInspection] = useState<RepositoryInspection | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -198,14 +210,18 @@ export default function RepositoryImportPanel() {
   const [isAsking, setIsAsking] = useState(false);
   const sourceRequestIdentity = useRef({ current: 0 });
   const questionRequestIdentity = useRef({ current: 0 });
+  const inspectionRequestIdentity = useRef({ current: 0 });
+  const restoreAttempted = useRef(false);
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  const inspectRepository = useCallback(async (url: string, restoring = false) => {
+    const requestId = beginRepositoryRequest(inspectionRequestIdentity.current);
     invalidateRequest(sourceRequestIdentity.current);
     invalidateRequest(questionRequestIdentity.current);
     setIsLoading(true);
+    setIsRestoring(restoring);
     setInspection(null);
     setErrorMessage(null);
+    setRestoreMessage(null);
     setSelectedPath(null);
     setSourceFile(null);
     setSourceError(null);
@@ -220,27 +236,102 @@ export default function RepositoryImportPanel() {
       const response = await fetch(`${API_BASE_URL}/api/repositories/inspect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repository_url: repositoryUrl }),
+        body: JSON.stringify({ repository_url: url }),
         cache: "no-store",
       });
 
       if (!response.ok) {
         const body = (await response.json().catch(() => null)) as ErrorResponse | null;
-        setErrorMessage(
-          body?.error?.message ?? "The repository could not be inspected. Check the URL and try again.",
-        );
+        const message = body?.error?.message ?? "The repository could not be inspected. Check the URL and try again.";
+        if (isCurrentRepositoryRequest(inspectionRequestIdentity.current, requestId)) {
+          if (restoring) {
+            if (response.status === 404 || body?.error?.code === "repository_not_found") {
+              try {
+                clearLastRepository(window.localStorage);
+              } catch {
+                // Storage access can be unavailable in browser privacy modes.
+              }
+            }
+            setRestoreMessage(`Could not restore the saved repository: ${message} You can inspect a repository manually.`);
+          } else {
+            setErrorMessage(message);
+          }
+        }
         return;
       }
 
       const result = (await response.json()) as RepositoryInspection;
-      setInspection(result);
+      if (isCurrentRepositoryRequest(inspectionRequestIdentity.current, requestId)) {
+        setInspection(result);
+        setRepositoryUrl(`https://github.com/${result.repository.full_name}`);
+        let saved = false;
+        try {
+          saved = saveLastRepository(result.repository.full_name, window.localStorage);
+        } catch {
+          // Inspection remains successful even if browser storage is unavailable.
+        }
+        if (!saved) setRestoreMessage("Repository inspected, but this browser could not save it for next time.");
+      }
     } catch {
-      setErrorMessage(
-        "Could not reach DevPilot's API. Make sure the backend is running at http://localhost:8000 and try again.",
-      );
+      if (isCurrentRepositoryRequest(inspectionRequestIdentity.current, requestId)) {
+        const message = "Could not reach DevPilot’s API. Make sure the backend is running at http://localhost:8000 and try again.";
+        if (restoring) {
+          setRestoreMessage(`Could not restore the saved repository. ${message} You can inspect a repository manually.`);
+        } else {
+          setErrorMessage(message);
+        }
+      }
     } finally {
-      setIsLoading(false);
+      if (isCurrentRepositoryRequest(inspectionRequestIdentity.current, requestId)) {
+        setIsLoading(false);
+        setIsRestoring(false);
+      }
     }
+  }, []);
+
+  useEffect(() => {
+    if (restoreAttempted.current) return;
+    restoreAttempted.current = true;
+    let saved;
+    try {
+      saved = readLastRepository(window.localStorage);
+    } catch {
+      saved = { status: "unavailable" as const };
+    }
+
+    if (saved.status === "invalid") {
+      void Promise.resolve().then(() => setRestoreMessage(
+        "The saved repository selection was invalid and has been cleared. Inspect a public repository manually.",
+      ));
+      return;
+    }
+    if (saved.status === "unavailable") {
+      void Promise.resolve().then(() => setRestoreMessage(
+        "This browser could not access the saved repository selection. You can inspect a repository manually.",
+      ));
+      return;
+    }
+    if (saved.status !== "valid") return;
+
+    const url = `https://github.com/${saved.repository.full_name}`;
+    void Promise.resolve().then(() => inspectRepository(url, true));
+  }, [inspectRepository]);
+
+  function handleRepositoryUrlChange(value: string) {
+    restoreAttempted.current = true;
+    invalidateRepositoryRequest(inspectionRequestIdentity.current);
+    setRepositoryUrl(value);
+    setIsLoading(false);
+    setIsRestoring(false);
+    setRestoreMessage(null);
+    setErrorMessage(null);
+  }
+
+  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    restoreAttempted.current = true;
+    setRestoreMessage(null);
+    void inspectRepository(repositoryUrl, false);
   }
 
   async function handleSelectFile(entry: RepositoryTreeEntry) {
@@ -350,7 +441,7 @@ export default function RepositoryImportPanel() {
   );
 
   return (
-    <section className="import-panel" aria-labelledby="import-title">
+    <section className="import-panel" id="codebases" aria-labelledby="import-title">
       <div className="import-copy">
         <div className="import-kicker"><span className="github-badge"><GitHubIcon /></span><span>START WITH A REPOSITORY</span></div>
         <h2 id="import-title">Bring your codebase<br className="desktop-break" /> into focus.</h2>
@@ -371,7 +462,7 @@ export default function RepositoryImportPanel() {
             spellCheck={false}
             placeholder="https://github.com/owner/repository"
             value={repositoryUrl}
-            onChange={(event) => setRepositoryUrl(event.target.value)}
+            onChange={(event) => handleRepositoryUrlChange(event.target.value)}
             aria-describedby="import-status"
             aria-invalid={errorMessage ? true : undefined}
           />
@@ -381,7 +472,8 @@ export default function RepositoryImportPanel() {
         </form>
         <p className="form-caption" id="import-status">Public repositories only <span>·</span> Uses GitHub&apos;s public REST API</p>
         {errorMessage && <p className="import-error" role="alert">{errorMessage}</p>}
-        {isLoading && <p className="import-loading" role="status">Fetching repository metadata and file tree…</p>}
+        {restoreMessage && <p className="import-error" role="status">{restoreMessage}</p>}
+        {isLoading && <p className="import-loading" role="status">{isRestoring ? "Restoring your last inspected repository…" : "Fetching repository metadata and file tree…"}</p>}
         {!inspection && !errorMessage && !isLoading && (
           <div className="repo-example"><span className="repo-example-icon"><GitHubIcon size={16} /></span><span>Paste a public repository URL to inspect its files</span><span className="repo-example-badge">PUBLIC</span></div>
         )}
@@ -423,7 +515,7 @@ export default function RepositoryImportPanel() {
           </div>
           <p className="tree-footnote">Select a file to view its public source. DevPilot does not clone or execute repository code.</p>
 
-          <section className="source-section" aria-labelledby="source-title">
+          <section className="source-section" id="qa" aria-labelledby="source-title">
             <div className="source-heading">
               <div><span className="section-eyebrow">CODEBASE Q&amp;A</span><h3 id="source-title">Selected source file</h3></div>
               {sourceFile && <span className="source-size">{sourceFile.size_bytes.toLocaleString()} bytes</span>}
@@ -521,6 +613,12 @@ export default function RepositoryImportPanel() {
           </section>
         </div>
       )}
+
+      <DeveloperMemoryPanel
+        key={inspection?.repository.full_name ?? "no-repository"}
+        repository={inspection?.repository ?? null}
+        selectedPath={selectedPath}
+      />
 
       <div className="import-decoration" aria-hidden="true"><span /><span /><span /><span /><span /></div>
     </section>

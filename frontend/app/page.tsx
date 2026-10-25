@@ -61,11 +61,11 @@ function Icon({ name, size = 20 }: { name: IconName; size?: number }) {
   }
 }
 
-const navigation: { label: string; icon: IconName; href: string; active?: boolean }[] = [
+const navigation: { label: string; icon: IconName; href?: string; active?: boolean; comingSoon?: boolean }[] = [
   { label: "Overview", icon: "overview", href: "#overview", active: true },
   { label: "Repositories", icon: "repository", href: "#codebases" },
   { label: "Developer Memory", icon: "memory", href: "#memory" },
-  { label: "API Guardian", icon: "guardian", href: "#diagnostics" },
+  { label: "API Guardian", icon: "guardian", comingSoon: true },
 ];
 
 const workspaces: {
@@ -74,18 +74,13 @@ const workspaces: {
   icon: IconName;
   accent: string;
   meta: string;
-  href: string;
+  href?: string;
+  comingSoon?: boolean;
 }[] = [
   { title: "Codebases", description: "Your repositories, understood.", icon: "code", accent: "mint", meta: "0 connected", href: "#codebases" },
-  { title: "Q&A", description: "Explore code with context.", icon: "question", accent: "violet", meta: "Dev Recall", href: "#memory" },
-  { title: "API Diagnostics", description: "Trace failures to their source.", icon: "pulse", accent: "amber", meta: "API Guardian", href: "#diagnostics" },
+  { title: "Q&A", description: "Explore code with context.", icon: "question", accent: "violet", meta: "Dev Recall", href: "#qa" },
+  { title: "API Diagnostics", description: "Trace failures to their source.", icon: "pulse", accent: "amber", meta: "API Guardian", comingSoon: true },
   { title: "Developer Memory", description: "Keep decisions close to the code.", icon: "memory", accent: "blue", meta: "Dev Recall", href: "#memory" },
-];
-
-const sampleActivities: { title: string; detail: string; time: string; icon: IconName; tone: string }[] = [
-  { title: "Repository connected", detail: "acme / storefront · main", time: "Example activity", icon: "branch", tone: "mint" },
-  { title: "Decision added to memory", detail: "Use cursor pagination for the activity feed", time: "Example activity", icon: "memory", tone: "violet" },
-  { title: "API failure analyzed", detail: "POST /api/checkout · 502 Bad Gateway", time: "Example activity", icon: "pulse", tone: "amber" },
 ];
 
 function BrandMark() {
@@ -111,11 +106,19 @@ function Sidebar() {
       <div className="side-label">WORKSPACE</div>
       <nav className="side-nav" aria-label="Main navigation">
         {navigation.map((item) => (
-          <a key={item.label} className={`nav-link${item.active ? " active" : ""}`} href={item.href} aria-current={item.active ? "page" : undefined}>
-            <Icon name={item.icon} size={18} />
-            <span>{item.label}</span>
-            {item.label === "Repositories" && <span className="nav-count">0</span>}
-          </a>
+          item.comingSoon ? (
+            <span key={item.label} className="nav-link nav-link-disabled" aria-disabled="true">
+              <Icon name={item.icon} size={18} />
+              <span>{item.label}</span>
+              <span className="nav-coming-soon">Soon</span>
+            </span>
+          ) : (
+            <a key={item.label} className={`nav-link${item.active ? " active" : ""}`} href={item.href} aria-current={item.active ? "page" : undefined}>
+              <Icon name={item.icon} size={18} />
+              <span>{item.label}</span>
+              {item.label === "Repositories" && <span className="nav-count">0</span>}
+            </a>
+          )
         ))}
       </nav>
 
@@ -140,15 +143,25 @@ function Sidebar() {
 }
 
 function WorkspaceCard({ item }: { item: (typeof workspaces)[number] }) {
-  return (
-    <a className="workspace-card" href={item.href}>
+  const contents = (
+    <>
       <div className={`workspace-icon ${item.accent}`}><Icon name={item.icon} size={20} /></div>
-      <span className="card-arrow"><Icon name="arrow" size={16} /></span>
+      {item.comingSoon ? (
+        <span className="coming-soon-label">Coming soon</span>
+      ) : (
+        <span className="card-arrow"><Icon name="arrow" size={16} /></span>
+      )}
       <h3>{item.title}</h3>
       <p>{item.description}</p>
       <span className="workspace-meta">{item.meta}</span>
-    </a>
+    </>
   );
+
+  if (item.comingSoon) {
+    return <article className="workspace-card workspace-card-disabled">{contents}</article>;
+  }
+
+  return <a className="workspace-card" href={item.href}>{contents}</a>;
 }
 
 export default function Home() {
@@ -189,19 +202,10 @@ export default function Home() {
           <section className="activity-section" aria-labelledby="activity-title">
             <div className="section-heading activity-heading">
               <div><div className="section-eyebrow">THE LATEST</div><h2 id="activity-title">Recent activity</h2></div>
-              <span className="sample-label"><span className="sample-label-dot" />SAMPLE DATA</span>
             </div>
-            <div className="activity-list">
-              {sampleActivities.map((activity, index) => (
-                <article className="activity-row" key={activity.title}>
-                  <div className={`activity-icon ${activity.tone}`}><Icon name={activity.icon} size={17} /></div>
-                  <div className="activity-copy"><h3>{activity.title}</h3><p>{activity.detail}</p></div>
-                  <span className="activity-time"><Icon name="clock" size={14} />{activity.time}</span>
-                  <span className="activity-index">0{index + 1}</span>
-                </article>
-              ))}
+            <div className="activity-list" aria-live="polite">
+              <p className="activity-empty">Your recent activity will appear here as you use DevPilot.</p>
             </div>
-            <p className="activity-footnote">Illustrative examples only. Your activity will appear here when connected.</p>
           </section>
 
           <footer className="dashboard-footer"><span>DEVPILOT <span className="footer-separator">/</span> ENGINEERING, IN SYNC</span><span>MADE FOR BUILDERS <span className="footer-spark">✳</span></span></footer>

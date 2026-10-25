@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 import os
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -7,8 +8,9 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-
+from app.api.decisions import router as decisions_router
 from app.api.repositories import router as repositories_router
+from app.database import create_database, initialize_database
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env", override=False)
 
@@ -52,8 +54,22 @@ def parse_cors_origins(value: str | None) -> list[str]:
     return origins or list(DEFAULT_CORS_ORIGINS)
 
 
-def create_app(cors_origins: list[str] | None = None) -> FastAPI:
-    application = FastAPI(title="DevPilot API", version="0.1.0")
+def create_app(
+    cors_origins: list[str] | None = None,
+    database_url: str | None = None,
+) -> FastAPI:
+    database = create_database(database_url)
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        try:
+            initialize_database(database)
+            yield
+        finally:
+            database.engine.dispose()
+
+    application = FastAPI(title="DevPilot API", version="0.1.0", lifespan=lifespan)
+    application.state.database = database
 
     application.add_middleware(
         CORSMiddleware,
@@ -62,11 +78,12 @@ def create_app(cors_origins: list[str] | None = None) -> FastAPI:
             if cors_origins is None
             else cors_origins
         ),
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["Content-Type"],
     )
 
     application.include_router(repositories_router, prefix="/api")
+    application.include_router(decisions_router, prefix="/api")
 
     @application.get("/healthz", include_in_schema=False)
     async def health_check() -> dict[str, str]:
